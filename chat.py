@@ -1,5 +1,6 @@
 import base64
 import collections
+import hashlib
 import subprocess
 from collections import OrderedDict
 import itertools
@@ -24,9 +25,17 @@ import random
 import string
 import anthropic
 import logging
+from PIL import Image
+from io import BytesIO
+
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
+
+
+class ChatException(Exception):
+    pass
+
 
 model_info_params = (
     'max_context_tokens', 'max_rsp_tokens', 'selectable',
@@ -60,7 +69,8 @@ all_models = {
         max_context_tokens=128000,
         selectable=False,
         input_price=10,
-        output_price=30
+        output_price=30,
+        vision=True
     ),
     'gpt-4-turbo-preview': ModelInfo(
         points_to='gpt-4-0125-preview',
@@ -363,7 +373,84 @@ def save_chat_history():
     update_chat_file_dropdown(file_path)
 
 
-def count_tokens(messages, model):
+class ImageHandler:
+    def __init__(self, url=None, path=None, b64data=None):
+        self.url = url
+        self.path = path
+        self.b64data = b64data
+        self._raw_data = None
+
+    def validate(self):
+        if self.path and not os.path.exists(self.path):
+            show_error_popup(f'Image [{self.path}] does not exist', raise_error=True)
+        if self.url:
+            pass  # TODO Check url
+        return self
+
+    @classmethod
+    def md5(cls, s):
+        md5_hash = hashlib.md5()
+        md5_hash.update(s.encode('utf-8'))
+        md5_hex = md5_hash.hexdigest()
+        return md5_hex
+
+    @classmethod
+    def get_from_cache(cls, url):
+        cache_dir = 'cache'
+        cached_path = f'{cache_dir}/{cls.md5(url)}'
+        if os.path.exists(cached_path):
+            with open(cached_path, 'rb') as image_file:
+                return image_file.read()
+        response = requests.get(url)
+        try:
+            response.raise_for_status()
+        except Exception as e:
+            show_error_popup(f'Read image [{url}] failed with {str(e)}', raise_error=True)
+        content = response.content
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cached_path, 'wb') as image_file:
+            image_file.write(content)
+        return content
+
+    @property
+    def raw(self):
+        if not self._raw_data:
+            if self.b64data:
+                b64byte = self.b64data.encode() if isinstance(self.b64data, str) else self.b64data
+                self._raw_data = base64.b64decode(b64byte)
+            elif self.path:
+                with open(self.path, 'rb') as image_file:
+                    self._raw_data = image_file.read()
+            elif self.url:
+                self._raw_data = self.get_from_cache(self.url)
+        return self._raw_data
+
+    def to_b64(self) -> str:
+        return base64.b64encode(self.raw).decode('utf8')
+
+    def count_tokens_for_high(self):
+        img = Image.open(BytesIO(self.raw))
+        w, h = img.size
+        long = max(w, h)
+        if long > 2048:
+            ratio = 2048 / long
+            w = int(w * ratio)
+            h = int(h * ratio)
+        short = min(w, h)
+        if short > 768:
+            ratio = 768 / short
+            w = int(w * ratio)
+            h = int(h * ratio)
+        wn = abs(-w//512)
+        hn = abs(-h//512)
+        return wn * hn * 170 + 85
+
+    @classmethod
+    def count_tokens_for_low(cls):
+        return 85
+
+
+def count_tokens(messages, model, vision_token=None):
     """Return the number of tokens used by a list of messages."""
     try:
         encoding = tiktoken.encoding_for_model(model)
@@ -377,13 +464,47 @@ def count_tokens(messages, model):
         tokens_per_message = 3
         tokens_per_name = 1
     num_tokens = 0
+    vision = get_model_info(model).vision
+    image_tokens = []
     for message in messages:
         num_tokens += tokens_per_message
         for key, value in message.items():
+            if key == 'content' and isinstance(value, list):
+                if not vision:
+                    show_error_popup(
+                        f'Cannot calculate tokens with model {model} for vision messages', raise_error=True
+                    )
+                for msg in value:
+                    msg_type = msg['type']
+                    num_tokens += len(encoding.encode(msg_type))
+                    # text
+                    if msg_type == 'text':
+                        num_tokens += len(encoding.encode(msg['text']))
+                        continue
+                    # image
+                    image_detail = msg['image_url']['detail']
+                    # image for low
+                    if image_detail == 'low':
+                        image_token = ImageHandler.count_tokens_for_low()
+                        num_tokens += image_token
+                        image_tokens.append(image_token)
+                        continue
+                    # image for high or auto
+                    image_url = msg['image_url']['url']
+                    if image_url.startswith('http'):
+                        image_token = ImageHandler(url=image_url).count_tokens_for_high()
+                    else:
+                        prefix = 'data:image/jpeg;base64,'
+                        image_token = ImageHandler(b64data=image_url[len(prefix):]).count_tokens_for_high()
+                    num_tokens += image_token
+                    image_tokens.append(image_token)
+                continue
             num_tokens += len(encoding.encode(value))
             if key == "name":
                 num_tokens += tokens_per_name
     num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
+    if isinstance(vision_token, list):
+        vision_token.extend(image_tokens)
     return num_tokens
 
 
@@ -398,6 +519,22 @@ def get_messages_from_chat_history():
                 "content": message["content_widget"].get("1.0", tk.END).strip()
             }
         )
+    return messages
+
+
+def parse_for_vision_messages(messages):
+    for message in messages:
+        if message["role"] == "user" and "content" in message:
+            # Check for image URLs and create a single message with a 'content' array
+            message['content'] = parse_and_create_image_messages(message["content"])
+
+
+def get_historical_messages_for_model(model=None):
+    model_info = get_model_info(model) if model else current_model_info()
+    messages = get_messages_from_chat_history()
+    if not model_info.vision:
+        return messages
+    parse_for_vision_messages(messages)
     return messages
 
 
@@ -435,7 +572,7 @@ def request_file_name():
     return suggested_filename
 
 
-def show_error_popup(message):
+def show_error_popup(message, raise_error=False):
     error_popup = tk.Toplevel(app)
     error_popup.title("Error")
     error_popup.geometry("350x100")
@@ -445,6 +582,9 @@ def show_error_popup(message):
 
     error_popup.focus_force()
     center_popup_over_main_window(error_popup, app, 0, -150)
+
+    if raise_error:
+        raise ChatException(message)
 
 
 def show_error_and_open_settings(message):
@@ -456,27 +596,10 @@ def show_error_and_open_settings(message):
 
 
 def parse_and_create_image_messages(content):
-    image_url_pattern = r"https?://[^\s,\"\{\}]+"
-    image_urls = re.findall(image_url_pattern, content, re.IGNORECASE)
-
-    parts = re.split(image_url_pattern, content)
-    messages = []
-
-    for i, text in enumerate(parts):
-        text = text.strip()
-        if text:
-            messages.append({"type": "text", "text": text})
-        if i < len(image_urls):
-            messages.append({"type": "image_url", "image_url": {"url": image_urls[i], "detail": image_detail_var.get()}})
-
-    return {"role": "user", "content": messages}
-
-
-def parse_and_create_image_messages_v2(content):
     image_pattern = re.compile(r'@image\[([^\[\]]+)\]')
     parts = image_pattern.split(content)
     if len(parts) == 1:
-        return {"role": "user", "content": content}
+        return content
     text_parts = parts[::2]
     image_parts = parts[1::2]
     messages = []
@@ -490,12 +613,7 @@ def parse_and_create_image_messages_v2(content):
                     {"type": "image_url", "image_url": {"url": image, "detail": image_detail_var.get()}}
                 )
             else:
-                if not os.path.exists(image):
-                    show_error_popup(f'Image [{image}] does not exist')
-                    return
-                with open(image, 'rb') as image_file:
-                    image_data = image_file.read()
-                base64_encoded = base64.b64encode(image_data).decode('utf8')
+                base64_encoded = ImageHandler(path=image).validate().to_b64()
                 messages.append(
                     {
                         "type": "image_url", "image_url": {
@@ -504,7 +622,7 @@ def parse_and_create_image_messages_v2(content):
                         }
                     }
                 )
-    return {"role": "user", "content": messages}
+    return messages
 
 
 def send_request():
@@ -512,6 +630,7 @@ def send_request():
         send_image_request()
     else:
         send_chat_request()
+
 
 def download_image(url, save_path, session=None):
     if url == 'mock-success':
@@ -606,7 +725,7 @@ def send_image_request():
 def send_chat_request():
     global is_streaming_cancelled
     # get messages
-    messages = get_messages_from_chat_history()
+    messages = get_historical_messages_for_model()
     # check if too many tokens
     model_max_context_window = current_model_info().max_context_tokens
     num_prompt_tokens = count_tokens(messages, model_var.get())
@@ -618,21 +737,6 @@ def send_chat_request():
             f" exceeds this model's maximum context window of {model_max_context_window}."
         )
         return
-    # convert messages to image api format, if necessary
-    if current_model_info().vision:
-        # Update the messages to include image data if any image URLs are found in the user's input
-        new_messages = []
-        for message in messages:
-            if message["role"] == "user" and "content" in message:
-                # Check for image URLs and create a single message with a 'content' array
-                message_with_images = parse_and_create_image_messages_v2(message["content"])
-                if not message_with_images:
-                    return
-                new_messages.append(message_with_images)
-            else:
-                # System or assistant messages are added unchanged
-                new_messages.append(message)
-        messages = new_messages
 
     # send request
     def request_thread():
@@ -868,18 +972,10 @@ def content_check_all_files(text_widget, text=None, only_last=False):
 
 
 def content_check_file(event, content_widget):
-    e = event
     if event and event.type == tk.EventType.KeyRelease:
         if event.char == ']':
-            key_pos = f'@{e.x},{e.y}+1c'
-            text = content_widget.get('1.0', key_pos)
-            if not text or len(text) < 5:
-                return
-            if text[-1] != ']' and text[-2] != ']':
-                return
-            if text[-2] == ']':
-                text = text[:-1]
-            content_check_all_files(content_widget, text=text, only_last=True)
+            text = content_widget.get('1.0', tk.END)
+            content_check_all_files(content_widget, text=text)
 
 
 def content_key_release(event, content_widget):
@@ -899,6 +995,19 @@ def open_with_preview(image_path):
     subprocess.run(["open", "-a", "Preview", image_path])
 
 
+def open_image_url(image_url):
+    os.system(f"open \"\" {image_url}")
+
+
+def open_image(image_source):
+    if image_source and image_source.startswith('http'):
+        open_image_url(image_source)
+    elif os.path.exists(image_source):
+        open_with_preview(image_source)
+    else:
+        show_error_popup(f'Image [{image_source}] does not exist')
+
+
 def content_image_click(event, content_widget):
     click_index = content_widget.index(f'@{event.x},{event.y}')
     all_ranges = content_widget.tag_ranges('file')
@@ -910,11 +1019,8 @@ def content_image_click(event, content_widget):
             image_sch = image_pattern.search(image_part)
             if not image_sch:
                 break
-            image_path = image_sch.groups()[0]
-            if os.path.exists(image_path):
-                open_with_preview(image_path)
-            else:
-                show_error_popup(f'Image [{image_path}] does not exist')
+            image_source = image_sch.groups()[0]
+            open_image(image_source)
             break
 
 
@@ -1293,7 +1399,8 @@ def show_popup():
     center_popup_over_main_window(popup, app)
     
     popup.focus_force()
-    
+
+
 def set_submit_button(active):
     if active:
         submit_button_text.set("Submit")
@@ -1345,43 +1452,39 @@ def update_parameters_visibility(*args):
 
 
 def show_token_count():
-    messages = get_messages_from_chat_history()
-    num_input_tokens = count_tokens(messages, model_var.get())
-    num_output_tokens = max_length_var.get()
-    total_tokens = num_input_tokens + num_output_tokens
     model_info = current_model_info()
-    
-    # Estimation for high detail image cost based on a 1024x1024 image
-    # todo: get the actual image sizes for a more accurate estimation
-    high_detail_cost_per_image = (170 * 4 + 85) / 1000 * 0.01  # 4 tiles for 1024x1024 + base tokens
-    
-    # Count the number of images in the messages
-    num_images = sum(1 for message in messages if "image_url" in message.get("content", ""))
-    
-    # Calculate vision cost if the model is vision preview
-    vision_cost = 0
-    if model_info.vision:
-        if image_detail_var.get() == "low":
-            # Fixed cost for low detail images
-            vision_cost_per_image = 0.00085
-            vision_cost = vision_cost_per_image * num_images
-        else:
-            # Estimated cost for high detail images
-            vision_cost = high_detail_cost_per_image * num_images
-        total_cost = vision_cost
-        cost_message = f"Vision Cost: ${total_cost:.5f} for {num_images} images"
+    if model_info.image:
+        dall_quality = dall_quality_var.get()
+        dall_n = dall_n_var.get()
+        image_price = model_info.image_prices.get(dall_quality, 0)
+        messagebox.showinfo(
+            'Image Cost',
+            f'Cost per image: {image_price}\n'
+            f'Image number: {dall_n}\n'
+            f'Total cost: {image_price * dall_n}'
+        )
     else:
-        # Calculate input and output costs for non-vision models
+        messages = get_historical_messages_for_model()
+        vision_token = []
+        num_input_tokens = count_tokens(messages, model_var.get(), vision_token=vision_token)
+        vision_tokens = sum(vision_token)
+        num_output_tokens = max_length_var.get()
+        total_tokens = num_input_tokens + num_output_tokens
+
         input_cost = model_info.input_price * num_input_tokens / 1000000
+        vision_cost = model_info.input_price * vision_tokens / 1000000 if vision_token else 0
         output_cost = model_info.output_price * num_output_tokens / 1000000
         total_cost = input_cost + output_cost
-        cost_message = f"Input Cost: ${input_cost:.5f}\nOutput Cost: ${output_cost:.5f}\nTotal Cost: ${total_cost:.5f}"
-    
-    messagebox.showinfo(
-        "Token Count and Cost", f"Number of tokens: {total_tokens} "
-                                f"(Input: {num_input_tokens}, Output: {num_output_tokens})\n"
-                                f"{cost_message}"
-    )
+        vision_cost_msg = f' (Vision: ${vision_cost:.5f})' if vision_token else ''
+        vision_token_msg = f' (Vision: {vision_tokens})' if vision_token else ''
+        messagebox.showinfo(
+            "Token Count and Cost", f"Number of tokens: {total_tokens}\n"
+                                    f"  Input: {num_input_tokens}{vision_token_msg}\n"
+                                    f"  Output: {num_output_tokens}\n"
+                                    f"Input Cost: ${input_cost:.5f}{vision_cost_msg}\n"
+                                    f"Output Cost: ${output_cost:.5f}\n"
+                                    f"Total Cost: ${total_cost:.5f}"
+        )
 
 
 # Initialize the main application window
